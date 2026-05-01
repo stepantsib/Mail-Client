@@ -1,0 +1,36 @@
+[project]
+name = "mail-client"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.ruff]
+# Длина строки (современный стандарт)
+line-length = 100
+# Версия Python, под которую пишется код
+target-version = "py313"
+
+[tool.ruff.lint]
+# Какие наборы правил использовать:
+# E - ошибки pycodestyle
+# F - ошибки Pyflakes
+# I - сортировка импортов (isort)
+# UP - обновления синтаксиса под новые версии Python (pyupgrade)
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+# Не ругаться, если у установленных библиотек нет типов
+ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "mypy>=1.20.2",
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.12",
+]
