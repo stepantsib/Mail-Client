@@ -4,7 +4,7 @@ def parse_msg_id(s: str) -> int:
     Возвращает положительное целое число или бросает ValueError.
     """
     s = s.strip()
-    if not s.isdigit():
+    if not s.isdecimal():
         raise ValueError(f"ID письма должен быть положительным целым числом, получено: {s!r}")
     value = int(s)
     if value < 1:
@@ -24,7 +24,7 @@ def parse_range(s: str, total: int) -> tuple[int, int]:
             start, end = map(int, s.split("-", 1))
         except ValueError:
             start, end = max(1, total - 9), total
-    elif s.isdigit():
+    elif s.isdecimal():
         count = int(s)
         start = max(1, total - count + 1)
         end = total

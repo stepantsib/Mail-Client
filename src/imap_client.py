@@ -175,6 +175,11 @@ def find_text_part(ast: list | str, prefix: str = "") -> str | None:
     return None
 
 
+def _sanitize_folder_name(name: str) -> str:
+    """Экранирует специальные символы в имени IMAP-папки."""
+    return name.replace("\\", "\\\\").replace('"', '\\"')
+
+
 class IMAPClient:
     def __init__(self, host: str, port: int, use_ssl: bool, verbose: bool = False) -> None:
         """
@@ -307,7 +312,8 @@ class IMAPClient:
         return sz, hdrs, atts
 
     def create_folder(self, folder_name: str) -> None:
-        resp = self.send_command(f'CREATE "{folder_name}"'.encode())
+        safe_name = _sanitize_folder_name(folder_name)
+        resp = self.send_command(f'CREATE "{safe_name}"'.encode())
         if b"OK" not in resp:
             raise RuntimeError(f"Ошибка создания папки: {resp.decode('utf-8', 'ignore')}")
 
@@ -320,7 +326,8 @@ class IMAPClient:
         self.send_command(b"EXPUNGE")
 
     def move_email(self, msg_id: int, folder_name: str) -> None:
-        resp = self.send_command(f'COPY {msg_id} "{folder_name}"'.encode())
+        safe_name = _sanitize_folder_name(folder_name)
+        resp = self.send_command(f'COPY {msg_id} "{safe_name}"'.encode())
         if b"OK" in resp:
             self.delete_email(msg_id)
         else:

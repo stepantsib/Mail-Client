@@ -187,12 +187,11 @@ class SMTPClient:
         if code != 354:
             raise RuntimeError(f"DATA failed: {resp}")
 
-        if message.startswith("."):
-            message = "." + message
-        message = message.replace("\r\n.", "\r\n..")
-        if not message.endswith("\r\n"):
-            message += "\r\n"
-        message += ".\r\n"
+        message = message.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        # Экранируем строки, начинающиеся с точки
+        lines = message.split("\r\n")
+        lines = [("." + line if line.startswith(".") else line) for line in lines]
+        message = "\r\n".join(lines)
 
         if self.verbose:
             print(">>> [MESSAGE BODY HIDDEN AS REQUIRED]")
@@ -226,7 +225,7 @@ class SMTPClient:
             cmd = cmd.encode("utf-8")
         if not cmd.endswith(b"\r\n"):
             cmd += b"\r\n"
-        self.sock.send(cmd)
+        self.sock.sendall(cmd)
         if self.verbose:
             visible = cmd.decode("utf-8", errors="replace").strip()
             if not visible.startswith("AUTH") and "password" not in visible.lower():

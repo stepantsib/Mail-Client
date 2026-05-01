@@ -50,7 +50,7 @@ class MailService:
         if files:
             message = build_mime_message(self.user, to, subject, body, files)
         else:
-            message = f"From: {self.user}\r\nTo: {to}\r\nSubject: {subject}\r\n\r\n{body}"
+            message = build_mime_message(self.user, to, subject, body, [])
 
         msg_size = len(message.encode("utf-8"))
         self.smtp.mail_from(self.user, msg_size=msg_size)

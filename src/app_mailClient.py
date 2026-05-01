@@ -237,7 +237,11 @@ class MailCLI:
         if not os.path.exists(custom_dir):
             os.makedirs(custom_dir)
 
-        full_path = os.path.join(custom_dir, filename)
+        safe_filename = os.path.basename(filename)
+        if not safe_filename:
+            print("[!] Некорректное имя файла.")
+            return
+        full_path = os.path.join(custom_dir, safe_filename)
         print(f"[*] Скачивание вложения из письма {msg_id}...")
         self.service.imap.download_attachment(msg_id, part_id, full_path)
         print(f"[+] Файл сохранен: {full_path}")
