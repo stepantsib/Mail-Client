@@ -1,6 +1,6 @@
 import re
 
-from imap_client import IMAPClient
+from src.imap_client import IMAPClient
 from smtp_client import SMTPClient, build_mime_message
 
 

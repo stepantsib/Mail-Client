@@ -138,9 +138,8 @@ def extract_attachments(ast: list | str, prefix: str = "") -> list[dict]:
             fname = find_name(ast)
             if fname:
                 size = int(ast[6]) if len(ast) > 6 and str(ast[6]).isdigit() else 0
-                # Если структура плоская, префикс может быть пустым. В IMAP
-                # корень часто
-                # запрашивается как "1"
+                # Если структура плоская, префикс может быть пустым.
+                # В IMAP корень часто запрашивается как "1"
                 att.append({"name": fname, "size": size, "part_id": prefix or "1"})
         else:  # Это составной узел (multipart), идем глубже
             part_num = 1
@@ -349,9 +348,8 @@ class IMAPClient:
         mime_resp = self.send_command(f"FETCH {msg_id} BODY.PEEK[{part_id}.MIME]".encode())
         body_resp = self.send_command(f"FETCH {msg_id} BODY.PEEK[{part_id}]".encode())
 
-        # ИСПРАВЛЕНИЕ №1: проверяем только тег-строку (последняя строка ответа),
-        # а не весь ответ. Иначе слова NO/BAD в теле письма дают ложное
-        # срабатывание.
+        # Проверяем только тег-строку (последняя строка ответа),
+        # а не весь ответ. Иначе слова NO/BAD в теле письма дают ложное срабатывание.
         def is_imap_error(resp: bytes) -> bool:
             for line in reversed(resp.split(b"\r\n")):
                 if re.match(rb"^A\d{3} ", line):
@@ -362,8 +360,7 @@ class IMAPClient:
             mime_resp = self.send_command(f"FETCH {msg_id} BODY.PEEK[HEADER]".encode())
             body_resp = self.send_command(f"FETCH {msg_id} BODY.PEEK[TEXT]".encode())
 
-        # ИСПРАВЛЕНИЕ №2: фильтруем строки точно по паттерну IMAP-тега (A001,
-        # A002...),
+        # Фильтруем строки точно по паттерну IMAP-тега (A001, A002...),
         # а не по любой строке, начинающейся с буквы A.
         def clean_imap_response(resp: bytes) -> bytes:
             lines = resp.split(b"\r\n")
