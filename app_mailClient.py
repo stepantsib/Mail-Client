@@ -1,8 +1,7 @@
+import getpass
 import json
 import os
 import re
-import getpass
-import socket
 
 from mail_service import MailService
 from validators import parse_msg_id, parse_range
@@ -34,11 +33,11 @@ def _save_server_config(config: dict) -> None:
 
 
 class MailCLI:
-    def __init__(self):
+    def __init__(self) -> None:
         self.service: MailService | None = None
         self.current_folder = "INBOX"
-        self.imap_host = None
-        self.imap_port = None
+        self.imap_host: str | None = None
+        self.imap_port: int | None = None
 
     def _choose_server(self, server_type: str) -> str:
         """Предлагает список серверов из конфига, кеширует последний выбор."""
@@ -78,15 +77,18 @@ class MailCLI:
 
             config[last_key] = selected
             _save_server_config(config)
-            return selected
+            return str(selected)
 
-    def _do_imap_connect(self):
+    def _do_imap_connect(self) -> None:
+        assert self.service is not None
+        assert self.imap_host is not None
+        assert self.imap_port is not None
         self.service.connect_imap(self.imap_host, self.imap_port, self.current_folder)
 
-    def login(self):
+    def login(self) -> None:
         host_str = self._choose_server("IMAP")
-        if ':' in host_str:
-            self.imap_host, port = host_str.split(':')
+        if ":" in host_str:
+            self.imap_host, port = host_str.split(":")
             self.imap_port = int(port)
         else:
             self.imap_host = host_str
@@ -100,15 +102,17 @@ class MailCLI:
         self._do_imap_connect()
         print(f"[+] Успешный вход! Текущая папка: {self.current_folder}")
 
-    def _prompt_msg_id(self, prompt: str = "Введите ID письма: ") -> str | None:
+    def _prompt_msg_id(self, prompt: str = "Введите ID письма: ") -> int | None:
         raw = input(prompt).strip()
         try:
-            return str(parse_msg_id(raw))
+            return parse_msg_id(raw)
         except ValueError as e:
             print(f"[!] {e}")
             return None
 
-    def show_menu(self):
+    def show_menu(self) -> None:
+        assert self.service is not None
+        assert self.service.imap is not None
         while True:
             print(f"\n--- Почтовый клиент (папка: {self.current_folder}) ---")
             print("1. Просмотреть список писем")
@@ -123,40 +127,40 @@ class MailCLI:
 
             choice = input("Выберите действие: ")
 
-            if choice == '0':
+            if choice == "0":
                 break
 
             try:
-                if choice == '1':
+                if choice == "1":
                     self.list_emails()
-                elif choice == '2':
+                elif choice == "2":
                     self.read_email()
-                elif choice == '3':
+                elif choice == "3":
                     name = input("Имя новой папки: ")
                     self.service.imap.create_folder(name)
                     print(f"[+] Папка '{name}' создана.")
-                elif choice == '4':
+                elif choice == "4":
                     msg_id = self._prompt_msg_id("ID письма: ")
                     if msg_id is None:
                         continue
                     folder = input("В какую папку перенести: ")
                     self.service.imap.move_email(msg_id, folder)
                     print(f"[+] Письмо {msg_id} перемещено в {folder}.")
-                elif choice == '5':
+                elif choice == "5":
                     msg_id = self._prompt_msg_id("ID письма для удаления: ")
                     if msg_id is None:
                         continue
                     self.service.imap.delete_email(msg_id)
                     print(f"[+] Письмо {msg_id} удалено.")
-                elif choice == '6':
+                elif choice == "6":
                     self.save_attachment_cli()
-                elif choice == '7':
+                elif choice == "7":
                     self.send_email_cli()
-                elif choice == '8':
+                elif choice == "8":
                     self.switch_folder()
                 else:
                     print("Неизвестная команда.")
-            except (ConnectionResetError, socket.timeout, BrokenPipeError, OSError) as e:
+            except (TimeoutError, ConnectionResetError, BrokenPipeError, OSError) as e:
                 print(f"\n[!] Соединение с сервером потеряно ({e}).")
                 print("[*] Выполняется автоматическое переподключение...")
                 try:
@@ -167,10 +171,12 @@ class MailCLI:
             except Exception as e:
                 print(f"[-] Ошибка: {e}")
 
-    def list_emails(self):
+    def list_emails(self) -> None:
+        assert self.service is not None
+        assert self.service.imap is not None
         imap = self.service.imap
         resp = imap.send_command(f'SELECT "{self.current_folder}"'.encode())
-        m = re.search(rb'\* (\d+) EXISTS', resp)
+        m = re.search(rb"\* (\d+) EXISTS", resp)
         total_msgs = int(m.group(1)) if m else 0
 
         if total_msgs == 0:
@@ -178,7 +184,9 @@ class MailCLI:
             return
 
         print(f"\nВсего писем в папке: {total_msgs}")
-        ans = input("Сколько последних писем показать? (введите число или диапазон '1-20', Enter для 10): ")
+        ans = input(
+            "Сколько последних писем показать? (введите число или диапазон '1-20', Enter для 10): "
+        )
 
         start, end = parse_range(ans, total_msgs)
 
@@ -192,7 +200,7 @@ class MailCLI:
         for i in sorted(headers.keys(), reverse=True):
             h = headers[i]
             atts = attachments.get(i, [])
-            total_size = sum(int(a.get('size', 0)) for a in atts)
+            total_size = sum(int(a.get("size", 0)) for a in atts)
 
             print(f"[{i}] От: {h.get('From')} | Тема: {h.get('Subject')}")
             print(f"    Вложений: {len(atts)} (Общий объем: {total_size} байт)")
@@ -201,7 +209,9 @@ class MailCLI:
                 print(f"      - {a['name']} ({a['size']} байт, ID секции: {a['part_id']})")
             print("-" * 40)
 
-    def read_email(self):
+    def read_email(self) -> None:
+        assert self.service is not None
+        assert self.service.imap is not None
         msg_id = self._prompt_msg_id()
         if msg_id is None:
             return
@@ -210,7 +220,9 @@ class MailCLI:
         print(body)
         print("----------------------------------")
 
-    def save_attachment_cli(self):
+    def save_attachment_cli(self) -> None:
+        assert self.service is not None
+        assert self.service.imap is not None
         msg_id = self._prompt_msg_id()
         if msg_id is None:
             return
@@ -230,7 +242,9 @@ class MailCLI:
         self.service.imap.download_attachment(msg_id, part_id, full_path)
         print(f"[+] Файл сохранен: {full_path}")
 
-    def switch_folder(self):
+    def switch_folder(self) -> None:
+        assert self.service is not None
+        assert self.service.imap is not None
         print("\n[*] Получение списка папок...")
         folders = self.service.imap.list_folders()
 
@@ -253,13 +267,14 @@ class MailCLI:
         new_folder = folders[int(choice) - 1]
         resp = self.service.imap.send_command(f'SELECT "{new_folder}"'.encode())
 
-        if b'OK' in resp:
+        if b"OK" in resp:
             self.current_folder = new_folder
             print(f"[+] Текущая папка: {self.current_folder}")
         else:
             print("[-] Не удалось открыть папку.")
 
-    def send_email_cli(self):
+    def send_email_cli(self) -> None:
+        assert self.service is not None
         print("\n--- Отправка письма ---")
         to_addr = input("Кому: ")
         subject = input("Тема: ")
@@ -279,7 +294,7 @@ class MailCLI:
         attachments_input = input("Пути к файлам через запятую (или Enter, если без вложений): ")
         image_files = []
         if attachments_input.strip():
-            raw_paths = [p.strip().strip('"').strip("'") for p in attachments_input.split(',')]
+            raw_paths = [p.strip().strip('"').strip("'") for p in attachments_input.split(",")]
             for p in raw_paths:
                 if os.path.isfile(p):
                     image_files.append(p)
@@ -288,7 +303,7 @@ class MailCLI:
 
         try:
             smtp_host_str = self._choose_server("SMTP")
-            host, port = smtp_host_str.split(':') if ':' in smtp_host_str else (smtp_host_str, 465)
+            host, port = smtp_host_str.split(":") if ":" in smtp_host_str else (smtp_host_str, 465)
 
             print(f"\n[*] Авторизация на {host} как {self.service.user}...")
             self.service.connect_smtp(host, int(port))

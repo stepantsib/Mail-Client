@@ -21,7 +21,7 @@ class SMTPClient:
         self.verbose = verbose
         self.sock = None
         self.is_tls = False
-        self.capabilities = set()
+        self.capabilities: set[str] = set()
 
     def _print_verbose(self, direction: str, text: str):
         """
@@ -41,7 +41,7 @@ class SMTPClient:
         Корректно накапливает данные и обрабатывает многострочные ответы SMTP,
         ожидая строку формата '<трехзначный_код><пробел><текст>'.
         """
-
+        assert self.sock is not None, "Сокет не подключен"
         data = b""
         while True:
             chunk = self.sock.recv(4096)
@@ -73,7 +73,8 @@ class SMTPClient:
     def connect(self):
         """
         Устанавливает TCP-соединение с сервером.
-        Если указан порт 465 и включен SSL, сразу оборачивает сокет в TLS-контекст (неявный SSL).
+        Если указан порт 465 и включен SSL, сразу оборачивает сокет в
+        TLS-контекст (неявный SSL).
         Ожидает от сервера приветственный код 220.
         """
 
@@ -94,7 +95,8 @@ class SMTPClient:
     def ehlo(self):
         """
         Отправляет команду приветствия EHLO и сохраняет поддерживаемые сервером
-        ESMTP-расширения (например, AUTH, STARTTLS, SIZE) во множество capabilities.
+        ESMTP-расширения (например, AUTH, STARTTLS, SIZE) во множество
+        capabilities.
         """
         self._send(f"EHLO {socket.gethostname()}")
         code, resp = self._recv()
@@ -134,7 +136,8 @@ class SMTPClient:
     def auth(self, username: str, password: str):
         """
         Выполняет авторизацию на сервере по механизму AUTH LOGIN.
-        Учетные данные кодируются в base64 перед отправкой. Ожидает код успешной авторизации 235.
+        Учетные данные кодируются в base64 перед отправкой. Ожидает код
+        успешной авторизации 235.
         """
         self._send("AUTH LOGIN")
         self._recv()
@@ -149,9 +152,14 @@ class SMTPClient:
     def mail_from(self, sender: str, msg_size: int = 0):
         """
         Начинает транзакцию отправки письма, указывая адрес отправителя.
-        Если сервер поддерживает ESMTP-расширение SIZE, передает ожидаемый размер письма.
+        Если сервер поддерживает ESMTP-расширение SIZE, передает ожидаемый
+        размер письма.
         """
-        size_cmd = f" SIZE={msg_size}" if msg_size > 0 and any(c.startswith("size") for c in self.capabilities) else ""
+        size_cmd = (
+            f" SIZE={msg_size}"
+            if msg_size > 0 and any(c.startswith("size") for c in self.capabilities)
+            else ""
+        )
         self._send(f"MAIL FROM:<{sender}>{size_cmd}")
         code, resp = self._recv()
         if code != 250:
@@ -170,8 +178,10 @@ class SMTPClient:
         """
         Отправляет содержимое письма.
         Выполняет dot-stuffing (экранирование строк, начинающихся с точки),
-        добавляет завершающую последовательность <CRLF>.<CRLF> и отправляет данные.
+        добавляет завершающую последовательность <CRLF>.<CRLF> и отправляет
+        данные.
         """
+        assert self.sock is not None
         self._send("DATA")
         code, resp = self._recv()
         if code != 354:
@@ -197,17 +207,21 @@ class SMTPClient:
 
     def quit(self):
         """
-        Корректно завершает сеанс связи с сервером командой QUIT и закрывает сокет.
+        Корректно завершает сеанс связи с сервером командой QUIT и закрывает
+        сокет.
         """
         self._send("QUIT")
         self._recv()
         self.sock.close()
 
-    def _send(self, cmd: str):
+    def _send(self, cmd: str | bytes) -> None:
         """
-        Добавляет корректный перенос строки (CRLF) к команде, кодирует её в байты
-        и отправляет в сокет. При включенном verbose скрывает пароли в логах консоли.
+        Добавляет корректный перенос строки (CRLF) к команде, кодирует её в
+        байты
+        и отправляет в сокет. При включенном verbose скрывает пароли в логах
+        консоли.
         """
+        assert self.sock is not None
         if isinstance(cmd, str):
             cmd = cmd.encode("utf-8")
         if not cmd.endswith(b"\r\n"):
@@ -219,22 +233,24 @@ class SMTPClient:
                 print(f">>> {visible}")
 
 
-def build_mime_message(from_addr: str, to_addr: str, subject: str,
-                       text_body: str, image_files: list) -> str:
+def build_mime_message(
+    from_addr: str, to_addr: str, subject: str, text_body: str, image_files: list
+) -> str:
     """
     Вручную формирует структуру электронного письма в формате multipart/mixed.
     Генерирует заголовки, кодирует текстовую часть и файлы изображений в base64
-    с правильным разбиением строк (по 76 символов) и расставляет boundary-разделители.
+    с правильным разбиением строк (по 76 символов) и расставляет
+    boundary-разделители.
     """
     boundary = f"===============happy_pictures_{uuid.uuid4().hex[:16]}=="
 
     # Заголовки письма
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     date_str = now.strftime("%a, %d %b %Y %H:%M:%S %z")
     message_id = f"<{uuid.uuid4()}@{socket.gethostname()}>"
 
     lines = [
-        f"Content-Type: multipart/mixed; boundary=\"{boundary}\"",
+        f'Content-Type: multipart/mixed; boundary="{boundary}"',
         "MIME-Version: 1.0",
         f"From: {from_addr}",
         f"To: {to_addr}",
@@ -246,17 +262,19 @@ def build_mime_message(from_addr: str, to_addr: str, subject: str,
 
     # Текстовая часть
     text_b64 = b64encode(text_body.encode("utf-8")).decode("ascii")
-    wrapped_text = "\r\n".join(text_b64[i:i + 76] for i in range(0, len(text_b64), 76))
+    wrapped_text = "\r\n".join(text_b64[i : i + 76] for i in range(0, len(text_b64), 76))
 
-    lines.extend([
-        f"--{boundary}",
-        'Content-Type: text/plain; charset="utf-8"',
-        "MIME-Version: 1.0",
-        "Content-Transfer-Encoding: base64",
-        "",
-        wrapped_text,
-        "",
-    ])
+    lines.extend(
+        [
+            f"--{boundary}",
+            'Content-Type: text/plain; charset="utf-8"',
+            "MIME-Version: 1.0",
+            "Content-Transfer-Encoding: base64",
+            "",
+            wrapped_text,
+            "",
+        ]
+    )
 
     # Файлы-вложения
     for img_path in image_files:
@@ -270,18 +288,20 @@ def build_mime_message(from_addr: str, to_addr: str, subject: str,
             img_data = f.read()
 
         img_b64 = b64encode(img_data).decode("ascii")
-        wrapped = "\r\n".join(img_b64[i:i + 76] for i in range(0, len(img_b64), 76))
+        wrapped = "\r\n".join(img_b64[i : i + 76] for i in range(0, len(img_b64), 76))
 
-        lines.extend([
-            f"--{boundary}",
-            f'Content-Type: {mime_type}; name="{filename}"',
-            "MIME-Version: 1.0",
-            "Content-Transfer-Encoding: base64",
-            f'Content-Disposition: attachment; filename="{filename}"',
-            "",
-            wrapped,
-            "",
-        ])
+        lines.extend(
+            [
+                f"--{boundary}",
+                f'Content-Type: {mime_type}; name="{filename}"',
+                "MIME-Version: 1.0",
+                "Content-Transfer-Encoding: base64",
+                f'Content-Disposition: attachment; filename="{filename}"',
+                "",
+                wrapped,
+                "",
+            ]
+        )
 
     lines.append(f"--{boundary}--")
     return "\r\n".join(lines) + "\r\n"
@@ -293,59 +313,76 @@ def get_image_mime_by_signature(filepath: str):
     Возвращает строку с MIME-типом или None, если файл не является картинкой.
     """
     try:
-        with open(filepath, 'rb') as f:
+        with open(filepath, "rb") as f:
             header = f.read(20)
     except OSError:
         return None
 
     # JPEG: начинается с FF D8 FF
-    if header.startswith(b'\xff\xd8\xff'):
-        return 'image/jpeg'
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
 
     # PNG: начинается с 89 50 4E 47 0D 0A 1A 0A
-    if header.startswith(b'\x89PNG\r\n\x1a\n'):
-        return 'image/png'
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
 
     # GIF: начинается с GIF87a или GIF89a
-    if header.startswith(b'GIF87a') or header.startswith(b'GIF89a'):
-        return 'image/gif'
+    if header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
+        return "image/gif"
 
     # BMP: начинается с BM
-    if header.startswith(b'BM'):
-        return 'image/bmp'
+    if header.startswith(b"BM"):
+        return "image/bmp"
 
     # TIFF: начинается с II*NUL или MM NUL*
-    if header.startswith(b'II*\x00') or header.startswith(b'MM\x00*'):
-        return 'image/tiff'
+    if header.startswith(b"II*\x00") or header.startswith(b"MM\x00*"):
+        return "image/tiff"
 
     # WebP: начинается с RIFF, а с 8-го байта идет WEBP
-    if header.startswith(b'RIFF') and header[8:12] == b'WEBP':
-        return 'image/webp'
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return "image/webp"
 
     return None
 
 
 def main():
     parser = argparse.ArgumentParser(description="smtp-mime — отправка всех картинок из каталога")
-    parser.add_argument("-s", "--server", required=True,
-                        help="SMTP-сервер в формате host[:port] (по умолчанию порт 25)")
-    parser.add_argument("-t", "--to", required=True,
-                        help="Адрес получателя")
-    parser.add_argument("-f", "--from", dest="from_addr", default="<>",
-                        help="Адрес отправителя (по умолчанию <>)")
-    parser.add_argument("--subject", default="Happy Pictures",
-                        help="Тема письма (по умолчанию “Happy Pictures”)")
-    parser.add_argument("-d", "--directory", default=os.getcwd(),
-                        help="Каталог с изображениями (по умолчанию текущий)")
-    parser.add_argument("--ssl", action="store_true",
-                        help="Разрешить SSL/STARTTLS, если сервер поддерживает (по умолчанию выкл)")
-    parser.add_argument("--auth", action="store_true",
-                        help="Запрашивать авторизацию (пароль не отображается)")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Показывать протокол SMTP (кроме тела письма)")
-    parser.add_argument("-m", "--message",
-                        default="Happy Pictures!\n\nВсе изображения из каталога прикреплены как вложения.",
-                        help="Кастомный текст сообщения (по умолчанию стандартный текст)")
+    parser.add_argument(
+        "-s",
+        "--server",
+        required=True,
+        help="SMTP-сервер в формате host[:port] (по умолчанию порт 25)",
+    )
+    parser.add_argument("-t", "--to", required=True, help="Адрес получателя")
+    parser.add_argument(
+        "-f", "--from", dest="from_addr", default="<>", help="Адрес отправителя (по умолчанию <>)"
+    )
+    parser.add_argument(
+        "--subject", default="Happy Pictures", help="Тема письма (по умолчанию “Happy Pictures”)"
+    )
+    parser.add_argument(
+        "-d",
+        "--directory",
+        default=os.getcwd(),
+        help="Каталог с изображениями (по умолчанию текущий)",
+    )
+    parser.add_argument(
+        "--ssl",
+        action="store_true",
+        help="Разрешить SSL/STARTTLS, если сервер поддерживает (по умолчанию выкл)",
+    )
+    parser.add_argument(
+        "--auth", action="store_true", help="Запрашивать авторизацию (пароль не отображается)"
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Показывать протокол SMTP (кроме тела письма)"
+    )
+    parser.add_argument(
+        "-m",
+        "--message",
+        default="Happy Pictures!\n\nВсе изображения из каталога прикреплены как вложения.",
+        help="Кастомный текст сообщения (по умолчанию стандартный текст)",
+    )
 
     args = parser.parse_args()
 

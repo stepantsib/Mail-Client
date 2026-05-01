@@ -18,7 +18,8 @@ class MailService:
         self.current_folder: str = "INBOX"
 
     def connect_imap(self, host: str, port: int, folder: str = "INBOX") -> None:
-        """Устанавливает IMAP-соединение, аутентифицирует пользователя и открывает папку."""
+        """Устанавливает IMAP-соединение, аутентифицирует пользователя и
+        открывает папку."""
         self.current_folder = folder
         self.imap = IMAPClient(host, port, use_ssl=True, verbose=False)
         self.imap.connect()
@@ -27,8 +28,8 @@ class MailService:
             f'LOGIN "{self.user}" "{self.password}"'.encode(),
             is_sensitive=True,
         )
-        tag_lines = [line for line in resp.split(b'\r\n') if re.match(rb'^A\d{3} ', line)]
-        if not tag_lines or b' OK ' not in tag_lines[-1] + b' ':
+        tag_lines = [line for line in resp.split(b"\r\n") if re.match(rb"^A\d{3} ", line)]
+        if not tag_lines or b" OK " not in tag_lines[-1] + b" ":
             raise RuntimeError("Ошибка аутентификации: неверный логин или пароль.")
 
         self.imap.send_command(f'SELECT "{self.current_folder}"'.encode())
