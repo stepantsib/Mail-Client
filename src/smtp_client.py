@@ -193,6 +193,10 @@ class SMTPClient:
         lines = [("." + line if line.startswith(".") else line) for line in lines]
         message = "\r\n".join(lines)
 
+        if not message.endswith("\r\n"):
+            message += "\r\n"
+        message += ".\r\n"
+
         if self.verbose:
             print(">>> [MESSAGE BODY HIDDEN AS REQUIRED]")
 
