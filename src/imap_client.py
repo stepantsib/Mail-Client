@@ -166,11 +166,11 @@ def extract_attachments(ast: list | str, prefix: str = "") -> list[dict]:
     return out
 
 
-def find_text_part(ast: list | str, prefix: str = "") -> Any[str | None]:
+def find_text_part(ast: list | str, prefix: str = "") -> str | None:
     """Возвращает part_id первой text-части в дереве BODYSTRUCTURE (или None)."""
     for part_id, leaf in walk_bodystructure(ast, prefix):
         if str(leaf[0]).lower() == "text":
-            return part_id
+            return str(part_id)
     return None
 
 
