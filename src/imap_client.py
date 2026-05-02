@@ -1,11 +1,15 @@
 import argparse
 import base64
+import binascii
 import getpass
+import html
 import quopri
 import re
 import socket
 import ssl
 from typing import Any, BinaryIO
+
+from validators import parse_hostport
 
 
 def custom_decode_header(val: str) -> str:
@@ -113,65 +117,60 @@ def parse_imap_bodystructure(s: str) -> list:
     return ast[0] if ast else []
 
 
-def extract_attachments(ast: list | str, prefix: str = "") -> list[dict]:
-    """
-    Рекурсивно обходит AST-дерево структуры письма для поиска вложений.
-    Отслеживает иерархию (part_id), чтобы файл можно было скачать через
-    FETCH BODY.PEEK[
-    part_id].
-    """
+def walk_bodystructure(ast: list | str, prefix: str = ""):
+    """Генератор: обходит AST BODYSTRUCTURE и выдаёт (part_id, leaf_node).
 
-    def find_name(lst: list | str) -> str | None:
-        if isinstance(lst, list):
-            for i in range(len(lst) - 1):
-                if str(lst[i]).lower() in ("name", "filename") and isinstance(lst[i + 1], str):
-                    return custom_decode_header(lst[i + 1])
-            for item in lst:
-                res = find_name(item)
-                if res:
-                    return res
+    leaf_node — это сам список вида ['text', 'plain', ('charset', 'utf-8'), ...].
+    Через этот генератор реализованы и поиск вложений, и поиск text-частей —
+    раньше каркас обхода дублировался в каждой функции.
+    """
+    if not isinstance(ast, list) or not ast:
+        return
+    if isinstance(ast[0], str):  # Конечный узел (MIME-часть)
+        yield prefix or "1", ast
+        return
+    part_num = 1
+    for item in ast:
+        if isinstance(item, list):
+            new_prefix = f"{prefix}.{part_num}" if prefix else str(part_num)
+            yield from walk_bodystructure(item, new_prefix)
+            part_num += 1
+
+
+def _find_attachment_name(leaf: list) -> str | None:
+    """Ищет name/filename в параметрах MIME-части (RFC 3501 BODYSTRUCTURE)."""
+
+    def search(lst: list | str) -> str | None:
+        if not isinstance(lst, list):
+            return None
+        for i in range(len(lst) - 1):
+            if str(lst[i]).lower() in ("name", "filename") and isinstance(lst[i + 1], str):
+                return custom_decode_header(lst[i + 1])
+        for item in lst:
+            res = search(item)
+            if res:
+                return res
         return None
 
-    att: list[dict] = []
-    if isinstance(ast, list) and ast:
-        if isinstance(ast[0], str):  # Это конечный узел (MIME-часть)
-            fname = find_name(ast)
-            if fname:
-                size = int(ast[6]) if len(ast) > 6 and str(ast[6]).isdigit() else 0
-                # Если структура плоская, префикс может быть пустым.
-                # В IMAP корень часто запрашивается как "1"
-                att.append({"name": fname, "size": size, "part_id": prefix or "1"})
-        else:  # Это составной узел (multipart), идем глубже
-            part_num = 1
-            for item in ast:
-                if isinstance(item, list):
-                    # Формируем иерархический индекс: "1.2", "2", и т.д.
-                    new_prefix = f"{prefix}.{part_num}" if prefix else str(part_num)
-                    att.extend(extract_attachments(item, new_prefix))
-                    part_num += 1
-    return att
+    return search(leaf)
 
 
-def find_text_part(ast: list | str, prefix: str = "") -> str | None:
-    """
-    Рекурсивно ищет текстовую часть (text/plain или text/html) в дереве
-    BODYSTRUCTURE.
-    Возвращает точный part_id (например, '1', '1.1', '2').
-    """
-    if isinstance(ast, list) and ast:
-        if isinstance(ast[0], str):  # Это конечный узел (MIME-часть)
-            mime_type = str(ast[0]).lower()
-            if mime_type == "text":
-                return prefix or "1"
-        else:  # Это составной узел (multipart), идем вглубь
-            part_num = 1
-            for item in ast:
-                if isinstance(item, list):
-                    new_prefix = f"{prefix}.{part_num}" if prefix else str(part_num)
-                    res = find_text_part(item, new_prefix)
-                    if res:
-                        return res
-                    part_num += 1
+def extract_attachments(ast: list | str, prefix: str = "") -> list[dict]:
+    """Возвращает список вложений в виде ``[{name, size, part_id}, ...]``."""
+    out: list[dict] = []
+    for part_id, leaf in walk_bodystructure(ast, prefix):
+        fname = _find_attachment_name(leaf)
+        if fname:
+            size = int(leaf[6]) if len(leaf) > 6 and str(leaf[6]).isdigit() else 0
+            out.append({"name": fname, "size": size, "part_id": part_id})
+    return out
+
+
+def find_text_part(ast: list | str, prefix: str = "") -> Any[str | None]:
+    """Возвращает part_id первой text-части в дереве BODYSTRUCTURE (или None)."""
+    for part_id, leaf in walk_bodystructure(ast, prefix):
+        if str(leaf[0]).lower() == "text":
+            return part_id
     return None
 
 
@@ -214,6 +213,54 @@ def _imap_literal(value: str) -> bytes:
         return b"{" + str(len(raw)).encode("ascii") + b"}\r\n" + raw
     escaped = raw.replace(b"\\", b"\\\\").replace(b'"', b'\\"')
     return b'"' + escaped + b'"'
+
+
+_LITERAL_RE = re.compile(rb"\{(\d+)\+?\}\r\n")
+_TAG_OK_RE = re.compile(rb"^A\d+ (OK|NO|BAD)\b")
+
+
+def extract_imap_literal(resp: bytes) -> bytes:
+    """Извлекает первый IMAP literal ``{N}\\r\\n<N байтов>`` из ответа сервера.
+
+    Надёжнее, чем ``split('\\r\\n')`` + slice — последнее ломается на коротких
+    ответах и на телах писем, начинающихся с ``* `` (RFC 3501 §4.3).
+    """
+    m = _LITERAL_RE.search(resp)
+    return resp[m.end() : m.end() + int(m.group(1))] if m else b""
+
+
+def imap_response_ok(resp: bytes) -> bool:
+    """Возвращает True, если последняя тэг-строка ответа — ``<TAG> OK``.
+
+    Корректно отделяет тэг-строку от untagged data (``* ...``) и от тела письма,
+    избегая ложных срабатываний на слово "OK" внутри payload.
+    """
+    for line in reversed(resp.split(b"\r\n")):
+        m = _TAG_OK_RE.match(line)
+        if m:
+            return m.group(1) == b"OK"
+    return False
+
+
+def decode_cte(content: bytes, mime_headers: str) -> bytes:
+    """Декодирует Content-Transfer-Encoding: base64 / quoted-printable.
+
+    При ошибке декодирования возвращает исходные байты — лучше показать сырое,
+    чем уронить функцию (раньше один путь молча игнорировал ошибки, другой —
+    падал; теперь поведение симметрично).
+    """
+    h = mime_headers.lower()
+    if "content-transfer-encoding: base64" in h:
+        try:
+            return base64.b64decode(content)
+        except (binascii.Error, ValueError):
+            return content
+    if "content-transfer-encoding: quoted-printable" in h:
+        try:
+            return quopri.decodestring(content)
+        except ValueError:
+            return content
+    return content
 
 
 class IMAPClient:
@@ -263,8 +310,10 @@ class IMAPClient:
             if self.verbose and not line.startswith((b"* BODY", b"* FETCH")):
                 print(f"<<< {line.decode('utf-8', 'replace').strip()}")
 
-            lit_match = re.search(rb"\{(\d+)\+?\}\r\n$", line)
-            if lit_match:  # Обработка IMAP Literals
+            lit_match = _LITERAL_RE.search(line)
+            # literal должен стоять в самом конце строки — иначе это просто фигурная
+            # скобка где-то в payload, а не маркер `{N}\r\n<bytes>`.
+            if lit_match and lit_match.end() == len(line):
                 lines.extend([line, self.file.read(int(lit_match.group(1)))])
                 continue
 
@@ -296,7 +345,7 @@ class IMAPClient:
 
         if self.use_ssl and self.port != 993:  # Явный STARTTLS
             if b"STARTTLS" in self.send_command(b"CAPABILITY"):
-                if b"OK" in self.send_command(b"STARTTLS").split(b"\r\n")[-2]:
+                if imap_response_ok(self.send_command(b"STARTTLS")):
                     self.sock = ssl.create_default_context().wrap_socket(
                         self.sock, server_hostname=self.host
                     )
@@ -352,29 +401,39 @@ class IMAPClient:
         cmd = b"LOGIN " + _imap_literal(user) + b" " + _imap_literal(password)
         return self.send_command(cmd, is_sensitive=True)
 
+    def select_folder(self, folder_name: str) -> bytes:
+        """Открывает папку с UTF-7 + quoted-string-экранированием.
+
+        Единая точка для всех вызовов SELECT — невозможно забыть санитизацию
+        в новом месте использования.
+        """
+        safe = _sanitize_folder_name(folder_name)
+        return self.send_command(f'SELECT "{safe}"'.encode())
+
     def create_folder(self, folder_name: str) -> None:
         safe_name = _sanitize_folder_name(folder_name)
         resp = self.send_command(f'CREATE "{safe_name}"'.encode())
-        if b"OK" not in resp:
+        if not imap_response_ok(resp):
             raise RuntimeError(f"Ошибка создания папки: {resp.decode('utf-8', 'ignore')}")
 
     def delete_email(self, msg_id: int) -> None:
         resp = self.send_command(f"STORE {msg_id} +FLAGS (\\Deleted)".encode())
-        if b"OK" not in resp:
+        if not imap_response_ok(resp):
             raise RuntimeError(
                 f"Ошибка пометки письма {msg_id} на удаление: {resp.decode('utf-8', 'ignore')}"
             )
+        # EXPUNGE без UID удаляет все помеченные \\Deleted письма. Для изоляции желательно
+        # UID EXPUNGE (RFC 4315 UIDPLUS), но это расширение и есть не на всех серверах.
         self.send_command(b"EXPUNGE")
 
     def move_email(self, msg_id: int, folder_name: str) -> None:
         safe_name = _sanitize_folder_name(folder_name)
         resp = self.send_command(f'COPY {msg_id} "{safe_name}"'.encode())
-        if b"OK" in resp:
-            self.delete_email(msg_id)
-        else:
+        if not imap_response_ok(resp):
             raise RuntimeError(
                 f"Ошибка перемещения письма {msg_id}: {resp.decode('utf-8', 'ignore')}"
             )
+        self.delete_email(msg_id)
 
     def fetch_email_body(self, msg_id: int) -> str:
         """Извлекает и декодирует текстовую часть письма, очищая её от
@@ -396,61 +455,35 @@ class IMAPClient:
         mime_resp = self.send_command(f"FETCH {msg_id} BODY.PEEK[{part_id}.MIME]".encode())
         body_resp = self.send_command(f"FETCH {msg_id} BODY.PEEK[{part_id}]".encode())
 
-        # Проверяем только тег-строку (последняя строка ответа),
-        # а не весь ответ. Иначе слова NO/BAD в теле письма дают ложное срабатывание.
-        def is_imap_error(resp: bytes) -> bool:
-            for line in reversed(resp.split(b"\r\n")):
-                if re.match(rb"^A\d+ ", line):
-                    return bool(re.match(rb"^A\d+ (NO|BAD)\b", line))
-            return False
-
-        if is_imap_error(body_resp):
+        # Если сервер вернул NO/BAD на BODY.PEEK[1] — пробуем общий fallback на TEXT.
+        if not imap_response_ok(body_resp):
             mime_resp = self.send_command(f"FETCH {msg_id} BODY.PEEK[HEADER]".encode())
             body_resp = self.send_command(f"FETCH {msg_id} BODY.PEEK[TEXT]".encode())
 
-        # Фильтруем строки точно по паттерну IMAP-тега (A001, A002...),
-        # а не по любой строке, начинающейся с буквы A.
-        def clean_imap_response(resp: bytes) -> bytes:
-            lines = resp.split(b"\r\n")
-            clean_lines = []
-            for line in lines[1:-2]:
-                is_tag_line = bool(re.match(rb"^A\d+\s", line))
-                is_untagged = line.startswith(b"* ")
-                if not is_tag_line and not is_untagged:
-                    clean_lines.append(line)
-            return b"\r\n".join(clean_lines)
-
-        mime_headers = clean_imap_response(mime_resp).decode("utf-8", errors="ignore").lower()
-        content = clean_imap_response(body_resp)
+        mime_headers = extract_imap_literal(mime_resp).decode("utf-8", errors="ignore").lower()
+        content = extract_imap_literal(body_resp)
 
         if not mime_headers.strip():
             mime_resp = self.send_command(f"FETCH {msg_id} BODY.PEEK[HEADER]".encode())
-            mime_headers = clean_imap_response(mime_resp).decode("utf-8", errors="ignore").lower()
+            mime_headers = extract_imap_literal(mime_resp).decode("utf-8", errors="ignore").lower()
 
-        # 3. Декодирование (Base64 или Quoted-Printable)
-        if "content-transfer-encoding: base64" in mime_headers:
-            try:
-                content = base64.b64decode(content)
-            except Exception:
-                pass
-        elif "content-transfer-encoding: quoted-printable" in mime_headers:
-            try:
-                content = quopri.decodestring(content)
-            except Exception:
-                pass
+        # 3. Декодирование Content-Transfer-Encoding (base64 / quoted-printable)
+        content = decode_cte(content, mime_headers)
 
-        # 4. Определяем кодировку и переводим в строку
+        # 4. Определяем кодировку и переводим в строку. Fallback на utf-8 для
+        # несуществующих имён charset (раньше падал LookupError).
         charset = "utf-8"
         charset_match = re.search(r'charset=["\']?([\w-]+)["\']?', mime_headers)
         if charset_match:
             charset = charset_match.group(1)
+        try:
+            text = content.decode(charset, errors="replace")
+        except LookupError:
+            text = content.decode("utf-8", errors="replace")
 
-        text = content.decode(charset, errors="replace")
-
-        # 5. Очищаем от HTML-разметки
-        if "<html" in text.lower() or "<body" in text.lower() or "<div" in text.lower():
-            import html
-
+        # 5. Очищаем от HTML-разметки. text.lower() считаем один раз — раньше было ×3.
+        lower = text.lower()
+        if "<html" in lower or "<body" in lower or "<div" in lower:
             text = re.sub(
                 r"<(style|script)[^>]*>.*?</\1>", "", text, flags=re.IGNORECASE | re.DOTALL
             )
@@ -465,22 +498,16 @@ class IMAPClient:
         mime_resp = self.send_command(f"FETCH {msg_id} BODY.PEEK[{part_id}.MIME]".encode())
         body_resp = self.send_command(f"FETCH {msg_id} BODY.PEEK[{part_id}]".encode())
 
-        def extract_payload(resp: bytes) -> bytes:
-            m = re.search(rb"\{(\d+)\+?\}\r\n", resp)
-            if m:
-                return resp[m.end() : m.end() + int(m.group(1))]
-            m_quote = re.search(rb'\[.*?\]\s+"([^"]*)"', resp)
+        mime_headers = extract_imap_literal(mime_resp).decode("utf-8", "ignore").lower()
+        raw_data = extract_imap_literal(body_resp)
+        if not raw_data:
+            # Fallback: некоторые серверы возвращают короткие части как
+            # quoted-string — `[...] "payload"` — без literal.
+            m_quote = re.search(rb'\[.*?\]\s+"([^"]*)"', body_resp)
             if m_quote:
-                return m_quote.group(1)
-            return b""
+                raw_data = m_quote.group(1)
 
-        mime_headers = extract_payload(mime_resp).decode("utf-8", "ignore").lower()
-        raw_data = extract_payload(body_resp)
-
-        if "content-transfer-encoding: base64" in mime_headers:
-            raw_data = base64.b64decode(raw_data)
-        elif "content-transfer-encoding: quoted-printable" in mime_headers:
-            raw_data = quopri.decodestring(raw_data)
+        raw_data = decode_cte(raw_data, mime_headers)
 
         with open(save_path, "wb") as f:
             f.write(raw_data)
@@ -514,19 +541,17 @@ def main() -> None:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
-    host, port = (
-        (args.server.rsplit(":", 1) + [143])[:2] if ":" in args.server else (args.server, 143)
-    )
+    host, port = parse_hostport(args.server, 143)
     pwd = getpass.getpass("Пароль: ")  # Не trim-аем: пробелы в пароле допустимы.
 
-    client = IMAPClient(host, int(port), args.ssl, args.verbose)
+    client = IMAPClient(host, port, args.ssl, args.verbose)
     try:
         client.connect()
         assert client.sock is not None
         try:
             client.sock.settimeout(120)
             login_resp = client.login(args.user, pwd)
-            if not any(re.match(rb"^A\d+ OK\b", line) for line in login_resp.split(b"\r\n")):
+            if not imap_response_ok(login_resp):
                 raise RuntimeError("Ошибка авторизации")
             client.sock.settimeout(60)
         except TimeoutError:

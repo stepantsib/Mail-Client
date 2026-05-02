@@ -2,10 +2,11 @@ import getpass
 import json
 import os
 import re
+from pathlib import Path
 
-from imap_client import _sanitize_folder_name
+from imap_client import imap_response_ok
 from mail_service import MailService
-from validators import parse_msg_id, parse_range
+from validators import parse_hostport, parse_msg_id, parse_range
 
 _CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".mailclient")
 _CONFIG_PATH = os.path.join(_CONFIG_DIR, "servers.json")
@@ -80,21 +81,31 @@ class MailCLI:
             _save_server_config(config)
             return str(selected)
 
+    def _service(self) -> MailService:
+        """Возвращает активный MailService или бросает RuntimeError.
+
+        Замена для boilerplate `assert self.service is not None` — срабатывает
+        и при ``python -O`` (когда assertы выключены).
+        """
+        if self.service is None:
+            raise RuntimeError("Не подключено к IMAP. Сначала выполните login().")
+        return self.service
+
+    def _imap(self):
+        """Возвращает активный IMAPClient или бросает RuntimeError."""
+        svc = self._service()
+        if svc.imap is None:
+            raise RuntimeError("IMAP-соединение не установлено.")
+        return svc.imap
+
     def _do_imap_connect(self) -> None:
-        assert self.service is not None
         assert self.imap_host is not None
         assert self.imap_port is not None
-        self.service.connect_imap(self.imap_host, self.imap_port, self.current_folder)
+        self._service().connect_imap(self.imap_host, self.imap_port, self.current_folder)
 
     def login(self) -> None:
         host_str = self._choose_server("IMAP")
-        if ":" in host_str:
-            # rsplit + maxsplit=1: иначе ввод вроде "a:b:c" падает с ValueError.
-            self.imap_host, port = host_str.rsplit(":", 1)
-            self.imap_port = int(port)
-        else:
-            self.imap_host = host_str
-            self.imap_port = 993
+        self.imap_host, self.imap_port = parse_hostport(host_str, 993)
 
         user = input("Email: ")
         password = getpass.getpass("Пароль: ")
@@ -113,8 +124,9 @@ class MailCLI:
             return None
 
     def show_menu(self) -> None:
-        assert self.service is not None
-        assert self.service.imap is not None
+        # IMAPClient получаем на каждой итерации: соединение может быть
+        # пересоздано в reconnect-обработчике ниже.
+        self._imap()  # ранний fail, если ещё не залогинены
         while True:
             print(f"\n--- Почтовый клиент (папка: {self.current_folder}) ---")
             print("1. Просмотреть список писем")
@@ -139,20 +151,20 @@ class MailCLI:
                     self.read_email()
                 elif choice == "3":
                     name = input("Имя новой папки: ")
-                    self.service.imap.create_folder(name)
+                    self._imap().create_folder(name)
                     print(f"[+] Папка '{name}' создана.")
                 elif choice == "4":
                     msg_id = self._prompt_msg_id("ID письма: ")
                     if msg_id is None:
                         continue
                     folder = input("В какую папку перенести: ")
-                    self.service.imap.move_email(msg_id, folder)
+                    self._imap().move_email(msg_id, folder)
                     print(f"[+] Письмо {msg_id} перемещено в {folder}.")
                 elif choice == "5":
                     msg_id = self._prompt_msg_id("ID письма для удаления: ")
                     if msg_id is None:
                         continue
-                    self.service.imap.delete_email(msg_id)
+                    self._imap().delete_email(msg_id)
                     print(f"[+] Письмо {msg_id} удалено.")
                 elif choice == "6":
                     self.save_attachment_cli()
@@ -174,10 +186,8 @@ class MailCLI:
                 print(f"[-] Ошибка: {e}")
 
     def list_emails(self) -> None:
-        assert self.service is not None
-        assert self.service.imap is not None
-        imap = self.service.imap
-        resp = imap.send_command(f'SELECT "{_sanitize_folder_name(self.current_folder)}"'.encode())
+        imap = self._imap()
+        resp = imap.select_folder(self.current_folder)
         m = re.search(rb"\* (\d+) EXISTS", resp)
         total_msgs = int(m.group(1)) if m else 0
 
@@ -212,19 +222,15 @@ class MailCLI:
             print("-" * 40)
 
     def read_email(self) -> None:
-        assert self.service is not None
-        assert self.service.imap is not None
         msg_id = self._prompt_msg_id()
         if msg_id is None:
             return
-        body = self.service.imap.fetch_email_body(msg_id)
+        body = self._imap().fetch_email_body(msg_id)
         print(f"\n--- Содержимое письма {msg_id} ---")
         print(body)
         print("----------------------------------")
 
     def save_attachment_cli(self) -> None:
-        assert self.service is not None
-        assert self.service.imap is not None
         msg_id = self._prompt_msg_id()
         if msg_id is None:
             return
@@ -241,27 +247,24 @@ class MailCLI:
 
         # Защита от path traversal: os.path.basename("..") возвращает "..",
         # поэтому резолвим и сверяем, что результат — потомок custom_dir.
-        from pathlib import Path
-
         safe_filename = Path(filename).name
         if not safe_filename or safe_filename in {".", ".."}:
             print("[!] Некорректное имя файла.")
             return
         base = Path(custom_dir).resolve()
         target = (base / safe_filename).resolve()
-        if target.parent != base:
+        if not target.is_relative_to(base):
             print("[!] Целевой путь вне разрешённого каталога.")
             return
         full_path = str(target)
         print(f"[*] Скачивание вложения из письма {msg_id}...")
-        self.service.imap.download_attachment(msg_id, part_id, full_path)
+        self._imap().download_attachment(msg_id, part_id, full_path)
         print(f"[+] Файл сохранен: {full_path}")
 
     def switch_folder(self) -> None:
-        assert self.service is not None
-        assert self.service.imap is not None
+        imap = self._imap()
         print("\n[*] Получение списка папок...")
-        folders = self.service.imap.list_folders()
+        folders = imap.list_folders()
 
         if not folders:
             print("[-] Не удалось получить список папок.")
@@ -280,18 +283,14 @@ class MailCLI:
             return
 
         new_folder = folders[int(choice) - 1]
-        resp = self.service.imap.send_command(
-            f'SELECT "{_sanitize_folder_name(new_folder)}"'.encode()
-        )
-
-        if b"OK" in resp:
+        if imap_response_ok(imap.select_folder(new_folder)):
             self.current_folder = new_folder
             print(f"[+] Текущая папка: {self.current_folder}")
         else:
             print("[-] Не удалось открыть папку.")
 
     def send_email_cli(self) -> None:
-        assert self.service is not None
+        svc = self._service()
         print("\n--- Отправка письма ---")
         to_addr = input("Кому: ")
         subject = input("Тема: ")
@@ -320,17 +319,15 @@ class MailCLI:
 
         try:
             smtp_host_str = self._choose_server("SMTP")
-            host, port = (
-                smtp_host_str.rsplit(":", 1) if ":" in smtp_host_str else (smtp_host_str, 465)
-            )
+            host, port = parse_hostport(smtp_host_str, 465)
 
-            print(f"\n[*] Авторизация на {host} как {self.service.user}...")
-            self.service.connect_smtp(host, int(port))
+            print(f"\n[*] Авторизация на {host} как {svc.user}...")
+            svc.connect_smtp(host, port)
 
             if image_files:
                 print(f"[*] Прикрепляем файлы: {len(image_files)} шт...")
 
-            self.service.send(to_addr, subject, body, image_files)
+            svc.send(to_addr, subject, body, image_files)
             print("[+] Письмо успешно отправлено!")
         except Exception as e:
             print(f"[-] Ошибка при отправке: {e}")

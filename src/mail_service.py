@@ -1,6 +1,4 @@
-import re
-
-from imap_client import IMAPClient, _sanitize_folder_name
+from imap_client import IMAPClient, imap_response_ok
 from smtp_client import SMTPClient, build_mime_message
 
 
@@ -25,12 +23,10 @@ class MailService:
         self.imap.connect()
 
         # Логин/пароль уходят через IMAP literal — нет IMAP-инъекции.
-        resp = self.imap.login(self.user, self.password)
-        if not any(re.match(rb"^A\d+ OK\b", line) for line in resp.split(b"\r\n")):
+        if not imap_response_ok(self.imap.login(self.user, self.password)):
             raise RuntimeError("Ошибка аутентификации: неверный логин или пароль.")
 
-        safe_folder = _sanitize_folder_name(self.current_folder)
-        self.imap.send_command(f'SELECT "{safe_folder}"'.encode())
+        self.imap.select_folder(self.current_folder)
 
     def connect_smtp(self, host: str, port: int) -> None:
         """Устанавливает SMTP-соединение и аутентифицирует пользователя."""

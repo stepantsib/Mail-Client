@@ -7,6 +7,14 @@ import ssl
 import uuid
 from base64 import b64encode
 
+from validators import parse_hostport
+
+
+def b64_mime_wrap(data: bytes, width: int = 76) -> str:
+    """Кодирует ``data`` в base64 и переносит каждые ``width`` символов (RFC 2045 §6.8)."""
+    s = b64encode(data).decode("ascii")
+    return "\r\n".join(s[i : i + width] for i in range(0, len(s), width))
+
 
 def _sanitize_addr(addr: str) -> str:
     """Удаляет CR/LF из адреса — защита от SMTP header-injection."""
@@ -309,8 +317,7 @@ def build_mime_message(
     ]
 
     # Текстовая часть
-    text_b64 = b64encode(text_body.encode("utf-8")).decode("ascii")
-    wrapped_text = "\r\n".join(text_b64[i : i + 76] for i in range(0, len(text_b64), 76))
+    wrapped_text = b64_mime_wrap(text_body.encode("utf-8"))
 
     lines.extend(
         [
@@ -335,8 +342,7 @@ def build_mime_message(
         with open(img_path, "rb") as f:
             img_data = f.read()
 
-        img_b64 = b64encode(img_data).decode("ascii")
-        wrapped = "\r\n".join(img_b64[i : i + 76] for i in range(0, len(img_b64), 76))
+        wrapped = b64_mime_wrap(img_data)
 
         encoded_name = _encode_header_value(filename)
         lines.extend(
@@ -435,11 +441,7 @@ def main():
 
     args = parser.parse_args()
 
-    if ":" in args.server:
-        host, port_str = args.server.rsplit(":", 1)
-        port = int(port_str)
-    else:
-        host, port = args.server, 25
+    host, port = parse_hostport(args.server, 25)
 
     # Собираем картинки, проверяя их реальное содержимое (сигнатуры)
     images = []

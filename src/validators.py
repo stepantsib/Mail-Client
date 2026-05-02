@@ -1,3 +1,20 @@
+def parse_hostport(s: str, default_port: int) -> tuple[str, int]:
+    """Парсит 'host', 'host:port' или 'host:port:extra' (последнее — ошибка).
+
+    rsplit с maxsplit=1 нужен на случай нестандартных входов; если порт не число —
+    бросается ValueError с понятным сообщением. Это единая точка для будущего
+    расширения (например, поддержки IPv6 [::1]:993).
+    """
+    s = s.strip()
+    if ":" not in s:
+        return s, default_port
+    host, _, port_s = s.rpartition(":")
+    try:
+        return host, int(port_s)
+    except ValueError as e:
+        raise ValueError(f"Неверный порт в адресе {s!r}") from e
+
+
 def parse_msg_id(s: str) -> int:
     """Парсит и проверяет строку с ID письма.
 
