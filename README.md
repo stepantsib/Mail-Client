@@ -26,7 +26,7 @@
 2. Запустите приложение:
    ```Bash
    cd mail-client
-   python app_mailClient.py
+   python app_mail_client.py
    ```
 Требования
 

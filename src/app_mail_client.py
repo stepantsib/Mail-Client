@@ -3,6 +3,7 @@ import json
 import os
 import re
 
+from imap_client import _sanitize_folder_name
 from mail_service import MailService
 from validators import parse_msg_id, parse_range
 
@@ -88,7 +89,8 @@ class MailCLI:
     def login(self) -> None:
         host_str = self._choose_server("IMAP")
         if ":" in host_str:
-            self.imap_host, port = host_str.split(":")
+            # rsplit + maxsplit=1: иначе ввод вроде "a:b:c" падает с ValueError.
+            self.imap_host, port = host_str.rsplit(":", 1)
             self.imap_port = int(port)
         else:
             self.imap_host = host_str
@@ -175,7 +177,7 @@ class MailCLI:
         assert self.service is not None
         assert self.service.imap is not None
         imap = self.service.imap
-        resp = imap.send_command(f'SELECT "{self.current_folder}"'.encode())
+        resp = imap.send_command(f'SELECT "{_sanitize_folder_name(self.current_folder)}"'.encode())
         m = re.search(rb"\* (\d+) EXISTS", resp)
         total_msgs = int(m.group(1)) if m else 0
 
@@ -237,11 +239,20 @@ class MailCLI:
         if not os.path.exists(custom_dir):
             os.makedirs(custom_dir)
 
-        safe_filename = os.path.basename(filename)
-        if not safe_filename:
+        # Защита от path traversal: os.path.basename("..") возвращает "..",
+        # поэтому резолвим и сверяем, что результат — потомок custom_dir.
+        from pathlib import Path
+
+        safe_filename = Path(filename).name
+        if not safe_filename or safe_filename in {".", ".."}:
             print("[!] Некорректное имя файла.")
             return
-        full_path = os.path.join(custom_dir, safe_filename)
+        base = Path(custom_dir).resolve()
+        target = (base / safe_filename).resolve()
+        if target.parent != base:
+            print("[!] Целевой путь вне разрешённого каталога.")
+            return
+        full_path = str(target)
         print(f"[*] Скачивание вложения из письма {msg_id}...")
         self.service.imap.download_attachment(msg_id, part_id, full_path)
         print(f"[+] Файл сохранен: {full_path}")
@@ -269,7 +280,9 @@ class MailCLI:
             return
 
         new_folder = folders[int(choice) - 1]
-        resp = self.service.imap.send_command(f'SELECT "{new_folder}"'.encode())
+        resp = self.service.imap.send_command(
+            f'SELECT "{_sanitize_folder_name(new_folder)}"'.encode()
+        )
 
         if b"OK" in resp:
             self.current_folder = new_folder
@@ -307,7 +320,9 @@ class MailCLI:
 
         try:
             smtp_host_str = self._choose_server("SMTP")
-            host, port = smtp_host_str.split(":") if ":" in smtp_host_str else (smtp_host_str, 465)
+            host, port = (
+                smtp_host_str.rsplit(":", 1) if ":" in smtp_host_str else (smtp_host_str, 465)
+            )
 
             print(f"\n[*] Авторизация на {host} как {self.service.user}...")
             self.service.connect_smtp(host, int(port))

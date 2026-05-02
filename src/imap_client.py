@@ -175,9 +175,45 @@ def find_text_part(ast: list | str, prefix: str = "") -> str | None:
     return None
 
 
+def _modutf7_encode(name: str) -> str:
+    """RFC 3501 §5.1.3 Modified UTF-7 — обязательная кодировка имён IMAP-папок."""
+    out: list[str] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if not buf:
+            return
+        b64 = base64.b64encode("".join(buf).encode("utf-16-be")).decode("ascii")
+        out.append("&" + b64.rstrip("=").replace("/", ",") + "-")
+        buf.clear()
+
+    for ch in name:
+        if 0x20 <= ord(ch) <= 0x7E:
+            flush()
+            out.append("&-" if ch == "&" else ch)
+        else:
+            buf.append(ch)
+    flush()
+    return "".join(out)
+
+
 def _sanitize_folder_name(name: str) -> str:
-    """Экранирует специальные символы в имени IMAP-папки."""
-    return name.replace("\\", "\\\\").replace('"', '\\"')
+    """Кодирует имя в Modified UTF-7 и экранирует спецсимволы quoted-string."""
+    encoded = _modutf7_encode(name)
+    return encoded.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _imap_literal(value: str) -> bytes:
+    """Безопасно сериализует произвольную строку в IMAP-аргумент.
+
+    Для не-ASCII или управляющих символов используется literal ``{N}\\r\\n<bytes>`` —
+    это устраняет IMAP-инъекцию через логин/пароль (RFC 3501 §4.3).
+    """
+    raw = value.encode("utf-8")
+    if any(b < 0x20 or b > 0x7E for b in raw):
+        return b"{" + str(len(raw)).encode("ascii") + b"}\r\n" + raw
+    escaped = raw.replace(b"\\", b"\\\\").replace(b'"', b'\\"')
+    return b'"' + escaped + b'"'
 
 
 class IMAPClient:
@@ -311,6 +347,11 @@ class IMAPClient:
 
         return sz, hdrs, atts
 
+    def login(self, user: str, password: str) -> bytes:
+        """Аутентифицируется через IMAP literal — закрывает IMAP-инъекцию."""
+        cmd = b"LOGIN " + _imap_literal(user) + b" " + _imap_literal(password)
+        return self.send_command(cmd, is_sensitive=True)
+
     def create_folder(self, folder_name: str) -> None:
         safe_name = _sanitize_folder_name(folder_name)
         resp = self.send_command(f'CREATE "{safe_name}"'.encode())
@@ -359,8 +400,8 @@ class IMAPClient:
         # а не весь ответ. Иначе слова NO/BAD в теле письма дают ложное срабатывание.
         def is_imap_error(resp: bytes) -> bool:
             for line in reversed(resp.split(b"\r\n")):
-                if re.match(rb"^A\d{3} ", line):
-                    return bool(re.match(rb"^A\d{3} (NO|BAD)\b", line))
+                if re.match(rb"^A\d+ ", line):
+                    return bool(re.match(rb"^A\d+ (NO|BAD)\b", line))
             return False
 
         if is_imap_error(body_resp):
@@ -373,7 +414,7 @@ class IMAPClient:
             lines = resp.split(b"\r\n")
             clean_lines = []
             for line in lines[1:-2]:
-                is_tag_line = bool(re.match(rb"^A\d{3}\s", line))
+                is_tag_line = bool(re.match(rb"^A\d+\s", line))
                 is_untagged = line.startswith(b"* ")
                 if not is_tag_line and not is_untagged:
                     clean_lines.append(line)
@@ -476,7 +517,7 @@ def main() -> None:
     host, port = (
         (args.server.rsplit(":", 1) + [143])[:2] if ":" in args.server else (args.server, 143)
     )
-    pwd = getpass.getpass("Пароль: ").replace(" ", "").strip()
+    pwd = getpass.getpass("Пароль: ")  # Не trim-аем: пробелы в пароле допустимы.
 
     client = IMAPClient(host, int(port), args.ssl, args.verbose)
     try:
@@ -484,12 +525,8 @@ def main() -> None:
         assert client.sock is not None
         try:
             client.sock.settimeout(120)
-            if (
-                b"OK"
-                not in client.send_command(f'LOGIN "{args.user}" "{pwd}"'.encode(), True).split(
-                    b"\r\n"
-                )[-2]
-            ):
+            login_resp = client.login(args.user, pwd)
+            if not any(re.match(rb"^A\d+ OK\b", line) for line in login_resp.split(b"\r\n")):
                 raise RuntimeError("Ошибка авторизации")
             client.sock.settimeout(60)
         except TimeoutError:

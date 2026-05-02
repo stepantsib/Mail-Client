@@ -1,6 +1,6 @@
 import re
 
-from imap_client import IMAPClient
+from imap_client import IMAPClient, _sanitize_folder_name
 from smtp_client import SMTPClient, build_mime_message
 
 
@@ -24,15 +24,13 @@ class MailService:
         self.imap = IMAPClient(host, port, use_ssl=True, verbose=False)
         self.imap.connect()
 
-        resp = self.imap.send_command(
-            f'LOGIN "{self.user}" "{self.password}"'.encode(),
-            is_sensitive=True,
-        )
-        tag_lines = [line for line in resp.split(b"\r\n") if re.match(rb"^A\d{3} ", line)]
-        if not tag_lines or b" OK " not in tag_lines[-1] + b" ":
+        # Логин/пароль уходят через IMAP literal — нет IMAP-инъекции.
+        resp = self.imap.login(self.user, self.password)
+        if not any(re.match(rb"^A\d+ OK\b", line) for line in resp.split(b"\r\n")):
             raise RuntimeError("Ошибка аутентификации: неверный логин или пароль.")
 
-        self.imap.send_command(f'SELECT "{self.current_folder}"'.encode())
+        safe_folder = _sanitize_folder_name(self.current_folder)
+        self.imap.send_command(f'SELECT "{safe_folder}"'.encode())
 
     def connect_smtp(self, host: str, port: int) -> None:
         """Устанавливает SMTP-соединение и аутентифицирует пользователя."""
@@ -47,10 +45,7 @@ class MailService:
         if self.smtp is None:
             raise RuntimeError("SMTP-соединение не установлено.")
 
-        if files:
-            message = build_mime_message(self.user, to, subject, body, files)
-        else:
-            message = build_mime_message(self.user, to, subject, body, [])
+        message = build_mime_message(self.user, to, subject, body, files or [])
 
         msg_size = len(message.encode("utf-8"))
         self.smtp.mail_from(self.user, msg_size=msg_size)

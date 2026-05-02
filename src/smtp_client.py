@@ -8,6 +8,24 @@ import uuid
 from base64 import b64encode
 
 
+def _sanitize_addr(addr: str) -> str:
+    """Удаляет CR/LF из адреса — защита от SMTP header-injection."""
+    cleaned = addr.replace("\r", "").replace("\n", "").strip().strip("<>")
+    if not cleaned:
+        raise ValueError("Адрес не может быть пустым")
+    return cleaned
+
+
+def _encode_header_value(value: str) -> str:
+    """Вычищает CRLF и кодирует не-ASCII в RFC 2047 (=?utf-8?B?...?=)."""
+    cleaned = value.replace("\r", " ").replace("\n", " ")
+    try:
+        cleaned.encode("ascii")
+        return cleaned
+    except UnicodeEncodeError:
+        return "=?utf-8?B?" + b64encode(cleaned.encode("utf-8")).decode("ascii") + "?="
+
+
 class SMTPClient:
     """Низкоуровневый SMTP-клиент с обработкой многострочных ответов"""
 
@@ -22,6 +40,9 @@ class SMTPClient:
         self.sock = None
         self.is_tls = False
         self.capabilities: set[str] = set()
+        # Во время AUTH LOGIN следующие команды — base64 учётные данные,
+        # их нельзя выводить в verbose-лог.
+        self._auth_in_progress = False
 
     def _print_verbose(self, direction: str, text: str):
         """
@@ -134,19 +155,29 @@ class SMTPClient:
         return True
 
     def auth(self, username: str, password: str):
+        """AUTH LOGIN с проверкой кодов 334/235.
+
+        Прежняя версия отправляла base64-пароль даже если сервер отверг саму
+        команду AUTH LOGIN — утечка учётных данных.
         """
-        Выполняет авторизацию на сервере по механизму AUTH LOGIN.
-        Учетные данные кодируются в base64 перед отправкой. Ожидает код
-        успешной авторизации 235.
-        """
-        self._send("AUTH LOGIN")
-        self._recv()
-        self._send(b64encode(username.encode("utf-8")).decode())
-        self._recv()
-        self._send(b64encode(password.encode("utf-8")).decode())
-        code, resp = self._recv()
-        if code != 235:
-            raise RuntimeError(f"AUTH failed: {resp}")
+        self._auth_in_progress = True
+        try:
+            self._send("AUTH LOGIN")
+            code, resp = self._recv()
+            if code != 334:
+                raise RuntimeError(f"AUTH LOGIN отклонён: {resp}")
+
+            self._send(b64encode(username.encode("utf-8")).decode())
+            code, resp = self._recv()
+            if code != 334:
+                raise RuntimeError(f"Сервер отклонил имя пользователя: {resp}")
+
+            self._send(b64encode(password.encode("utf-8")).decode())
+            code, resp = self._recv()
+            if code != 235:
+                raise RuntimeError(f"AUTH failed: {resp}")
+        finally:
+            self._auth_in_progress = False
         self._print_verbose("INFO", "AUTH successful")
 
     def mail_from(self, sender: str, msg_size: int = 0):
@@ -155,6 +186,7 @@ class SMTPClient:
         Если сервер поддерживает ESMTP-расширение SIZE, передает ожидаемый
         размер письма.
         """
+        sender = _sanitize_addr(sender)
         size_cmd = (
             f" SIZE={msg_size}"
             if msg_size > 0 and any(c.startswith("size") for c in self.capabilities)
@@ -169,6 +201,7 @@ class SMTPClient:
         """
         Указывает адрес получателя письма.
         """
+        recipient = _sanitize_addr(recipient)
         self._send(f"RCPT TO:<{recipient}>")
         code, resp = self._recv()
         if code not in (250, 251):
@@ -201,21 +234,29 @@ class SMTPClient:
             print(">>> [MESSAGE BODY HIDDEN AS REQUIRED]")
 
         self.sock.settimeout(180)
-        self.sock.send(message.encode("utf-8"))
-        self.sock.settimeout(30)
+        try:
+            # sendall, не send: send может отправить не все байты для большого тела.
+            self.sock.sendall(message.encode("utf-8"))
+        finally:
+            self.sock.settimeout(30)
 
         code, resp = self._recv()
         if code != 250:
             raise RuntimeError(f"Message not accepted: {resp}")
 
     def quit(self):
-        """
-        Корректно завершает сеанс связи с сервером командой QUIT и закрывает
-        сокет.
-        """
-        self._send("QUIT")
-        self._recv()
-        self.sock.close()
+        """Корректно завершает сессию: в try/finally, чтобы сокет всегда закрывался."""
+        try:
+            if self.sock is not None:
+                self._send("QUIT")
+                self._recv()
+        finally:
+            if self.sock is not None:
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
 
     def _send(self, cmd: str | bytes) -> None:
         """
@@ -230,9 +271,11 @@ class SMTPClient:
         if not cmd.endswith(b"\r\n"):
             cmd += b"\r\n"
         self.sock.sendall(cmd)
-        if self.verbose:
+        # В время AUTH LOGIN отправляются base64-строки username/password — они не
+        # начинаются с "AUTH", поэтому старая проверка startswith("AUTH") их пропускала.
+        if self.verbose and not self._auth_in_progress:
             visible = cmd.decode("utf-8", errors="replace").strip()
-            if not visible.startswith("AUTH") and "password" not in visible.lower():
+            if not visible.upper().startswith("AUTH"):
                 print(f">>> {visible}")
 
 
@@ -252,12 +295,14 @@ def build_mime_message(
     date_str = now.strftime("%a, %d %b %Y %H:%M:%S %z")
     message_id = f"<{uuid.uuid4()}@{socket.gethostname()}>"
 
+    safe_from = _sanitize_addr(from_addr)
+    safe_to = _sanitize_addr(to_addr)
     lines = [
         f'Content-Type: multipart/mixed; boundary="{boundary}"',
         "MIME-Version: 1.0",
-        f"From: {from_addr}",
-        f"To: {to_addr}",
-        f"Subject: {subject}",
+        f"From: {safe_from}",
+        f"To: {safe_to}",
+        f"Subject: {_encode_header_value(subject)}",
         f"Date: {date_str}",
         f"Message-ID: {message_id}",
         "",
@@ -293,13 +338,14 @@ def build_mime_message(
         img_b64 = b64encode(img_data).decode("ascii")
         wrapped = "\r\n".join(img_b64[i : i + 76] for i in range(0, len(img_b64), 76))
 
+        encoded_name = _encode_header_value(filename)
         lines.extend(
             [
                 f"--{boundary}",
-                f'Content-Type: {mime_type}; name="{filename}"',
+                f'Content-Type: {mime_type}; name="{encoded_name}"',
                 "MIME-Version: 1.0",
                 "Content-Transfer-Encoding: base64",
-                f'Content-Disposition: attachment; filename="{filename}"',
+                f'Content-Disposition: attachment; filename="{encoded_name}"',
                 "",
                 wrapped,
                 "",
