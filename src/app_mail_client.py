@@ -8,7 +8,8 @@ from imap_client import imap_response_ok
 from mail_service import MailService
 from validators import parse_hostport, parse_msg_id, parse_range
 
-_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".mailclient")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_CONFIG_DIR = os.path.join(_PROJECT_ROOT, ".mailclient")
 _CONFIG_PATH = os.path.join(_CONFIG_DIR, "servers.json")
 _DEFAULT_CONFIG = {
     "imap_servers": ["imap.yandex.ru:993", "imap.mail.ru:993", "imap.gmail.com:993"],
