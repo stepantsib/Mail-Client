@@ -308,15 +308,46 @@ class MailCLI:
             lines.append(line)
         body = "\n".join(lines[:-2])
 
-        attachments_input = input("Пути к файлам через запятую (или Enter, если без вложений): ")
+        attachments_input = input(
+            "Вложения (файлы, папки или маски через запятую, например: C:\\dir\\*.jpg, img_#.png): "
+        )
         image_files = []
         if attachments_input.strip():
             raw_paths = [p.strip().strip('"').strip("'") for p in attachments_input.split(",")]
             for p in raw_paths:
-                if os.path.isfile(p):
+                path_obj = Path(p)
+
+                if path_obj.is_file():
+                    # 1. Если это конкретный файл
                     image_files.append(p)
+                elif path_obj.is_dir():
+                    # 2. Если это директория — берем все файлы внутри
+                    for item in path_obj.iterdir():
+                        if item.is_file():
+                            image_files.append(str(item.resolve()))
+                elif "*" in p or "#" in p:
+                    # 3. Если используется маска
+                    directory = path_obj.parent
+                    mask = path_obj.name
+
+                    if directory.exists() and directory.is_dir():
+                        # Экранируем название, чтобы точки (.) не сломали регулярку,
+                        # а затем подставляем логику для * и #
+                        regex_pattern = re.escape(mask).replace(r"\*", ".*").replace("#", r"\d")
+                        compiled_regex = re.compile(f"^{regex_pattern}$")
+
+                        found = False
+                        for item in directory.iterdir():
+                            if item.is_file() and compiled_regex.match(item.name):
+                                image_files.append(str(item.resolve()))
+                                found = True
+
+                        if not found:
+                            print(f"[!] По маске '{p}' файлы не найдены.")
+                    else:
+                        print(f"[!] Директория для маски не найдена: {directory}")
                 else:
-                    print(f"[!] Файл не найден и будет пропущен: {p}")
+                    print(f"[!] Путь не существует: {p}")
 
         try:
             smtp_host_str = self._choose_server("SMTP")
